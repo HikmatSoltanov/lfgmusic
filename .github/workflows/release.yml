@@ -1,0 +1,49 @@
+name: Wispbyte release
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['README.md']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          java-package: jre
+      - name: Build and test
+        run: |
+          npm ci --include=dev --no-fund
+          npm run check
+          npm run build
+          node --import tsx --test test/*.test.ts
+          mvn -B -f audio-engine/pom.xml package
+          node scripts/update-engine-checksum.mjs
+      - name: Package
+        run: |
+          mkdir -p package/bin/jre
+          git archive HEAD | tar -x -C package
+          cp -a "$JAVA_HOME/." package/bin/jre/
+          cp -a dist package/
+          mkdir -p package/audio-engine/target
+          cp audio-engine/target/music-engine.jar package/audio-engine/target/
+          cp audio-engine/runtime.json package/audio-engine/runtime.json
+          chmod +x package/scripts/*.sh
+          cd package
+          zip -qr ../lfgmusic-wispbyte-linux-x64.zip .
+          cd ..
+          sha256sum lfgmusic-wispbyte-linux-x64.zip > SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="wispbyte-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" lfgmusic-wispbyte-linux-x64.zip SHA256SUMS --target "$GITHUB_SHA" --title "LFGMusic for Wispbyte ($tag)" --notes "Linux x64 package with compiled Node app and Java audio engine. No .env, data, media or credentials. Select Node.js 24, install FFmpeg, run npm ci --include=dev, npm run init:env, configure .env, then npm start. See HOSTING.md."
