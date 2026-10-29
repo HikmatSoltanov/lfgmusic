@@ -1,0 +1,16 @@
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+import 'dotenv/config';
+const root = resolve(process.env.AUDIO_ROOT || 'media');
+const file = resolve(root, 'demo-tone.wav');
+const catalogFile = resolve(process.env.AUDIO_CATALOG || 'media/catalog.json');
+mkdirSync(root, { recursive: true });
+const entries = existsSync(catalogFile) ? JSON.parse(readFileSync(catalogFile, 'utf8')) : [];
+if (!Array.isArray(entries)) throw new Error('Каталог должен быть массивом.');
+if (entries.some(t => t.id === 'demo-tone') || existsSync(file)) throw new Error('Демо уже существует; существующие файлы не перезаписаны.');
+const r = spawnSync(process.env.FFMPEG_PATH || 'ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=8', '-filter:a', 'volume=0.2', file], { stdio: 'inherit', windowsHide: true });
+if (r.status !== 0) throw new Error('Установите FFmpeg.');
+entries.push({ id: 'demo-tone', title: 'Тестовый сигнал 440 Гц', artist: 'Локальный генератор FFmpeg', file: 'demo-tone.wav', durationMs: 8000, rights: 'Синтезированный тестовый сигнал, создан владельцем бота' });
+writeFileSync(catalogFile, JSON.stringify(entries, null, 2) + '\n');
+console.log('Добавлен собственный тестовый сигнал. Перезапустите бота и вызовите /play query:demo-tone. Это не музыкальная композиция Spotify.');

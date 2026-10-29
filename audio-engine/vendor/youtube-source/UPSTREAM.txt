@@ -1,0 +1,4 @@
+Source: https://github.com/lavalink-devs/youtube-source
+Tag: 1.5.2
+Commit: 5b2c08ab16b5af86755a660be92ceb7dd81bffde
+Common sources plus the upstream v2 overrides, for LavaPlayer 2.x. Version resource expanded as in upstream Gradle build.

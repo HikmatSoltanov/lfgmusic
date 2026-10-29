@@ -1,0 +1,8 @@
+{
+  "sha256": "51972c1a50b159086cb34af3776c0dce2336003548225d2ca503b58bab4788fe",
+  "sourceVersion": "1.0.0",
+  "sourceLibraries": {
+    "lavaplayer": "2.2.1",
+    "youtube-source": "1.5.2"
+  }
+}

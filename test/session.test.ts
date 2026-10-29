@@ -1,0 +1,118 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { Client } from 'discord.js';
+import { Store } from '../src/store.js';
+import { Catalog } from '../src/catalog.js';
+import { Spotify } from '../src/spotify.js';
+import { Session } from '../src/session.js';
+import { config } from '../src/config.js';
+import { UserError, type SessionData } from '../src/types.js';
+test('Sessions: queue, duplicate protection, pause, skip, persistence, restore and guild isolation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'lfg-session-'));
+  const store = new Store(':memory:', '44'.repeat(32));
+  try {
+    const items = ['a', 'b'].map(id => ({ spotifyTrackId: id.toUpperCase().repeat(22), id, title: id, artist: 'Artist', file: `${id}.wav`, durationMs: 10000, rights: 'Own recording' }));
+    for (const t of items) writeFileSync(join(root, t.file), 'audio');
+    const catalogFile = join(root, 'catalog.json'); writeFileSync(catalogFile, JSON.stringify(items));
+    const catalog = new Catalog(root, catalogFile); let sends = 0; let edits = 0;
+    let deleted = false; const panels: any[] = [];
+    const message = { id: 'msg', edit: async (payload: any) => { panels.push(payload); edits++; if (deleted) { deleted = false; throw { code: 10008 }; } return message; } };
+    const channel = { isTextBased: () => true, send: async (payload: any) => { panels.push(payload); sends++; return message; }, messages: { fetch: async () => message } };
+    const client = { guilds: { fetch: async () => ({ channels: { fetch: async () => ({ isVoiceBased: () => true }) } }) }, channels: { fetch: async () => channel } } as unknown as Client;
+    const create = (data: SessionData, source = new Spotify(store)) => {
+      const s = new Session(data, client, store, source, catalog, fn => { void fn(); });
+      s.voice.connect = async () => {}; s.voice.ready = () => true;
+      s.voice.play = () => {}; s.voice.stop = () => {}; s.voice.close = () => {};
+      s.voice.pause = () => true; s.voice.resume = () => true; s.voice.position = () => 2000;
+      return s;
+    };
+    const data: SessionData = { guildId: 'g1', ownerId: 'u', mode: 'voice', voiceChannelId: 'vc', textChannelId: 'tc', queue: [], positionMs: 0, paused: false };
+    const s = create(data); await s.init();
+    await s.add('a'); await s.add('b'); assert.equal(data.currentId, 'a'); assert.deepEqual(data.queue, ['b']);
+    await assert.rejects(s.add('a'), /уже/); await assert.rejects(s.add('b'), /уже/);
+    await s.control('pause'); assert.equal(data.paused, true);
+    await s.control('resume'); assert.equal(data.paused, false);
+    await s.control('pause'); s.save(); const saved = store.sessions()[0];
+    assert.equal(saved.positionMs, 2000); assert.equal(saved.paused, true);
+    let restored: unknown[] = [];
+    const recovered = create(saved); recovered.voice.play = (...args) => { restored = args; };
+    await recovered.init(); assert.equal(restored[1], 2000); assert.equal(restored[2], true);
+    assert.equal(sends, 1, 'embed is edited, not spammed'); assert.ok(edits > 0);
+    deleted = true; await recovered.render(true); assert.equal(sends, 2, 'deleted cached panel is recreated');
+    await recovered.control('skip'); assert.equal(saved.currentId, 'b'); assert.deepEqual(saved.queue, []);
+    const other = create({ ...data, guildId: 'g2', queue: [], currentId: undefined, messageId: undefined }); await other.init();
+    await other.add('a'); await recovered.control('skip'); assert.equal(saved.currentId, undefined); assert.equal(other.data.currentId, 'a');
+    await recovered.stop(); assert.equal(store.sessions().some(v => v.guildId === 'g1'), false);
+    await other.stop(false); assert.equal(store.sessions().some(v => v.guildId === 'g2'), true);
+    const real = create({ ...data, guildId: 'real', mode: 'real', queue: [], currentId: undefined });
+    await assert.rejects(real.add('a'), /Spotify/);
+    const source = new Spotify(store);
+    source.playback = async () => ({ track: { id: 'spotify', title: 'Current song', artist: 'Artist', durationMs: 10000 }, playing: true, progressMs: 1000, fetchedAt: Date.now() });
+    const monitoring = create({ ...data, guildId: 'monitor', mode: 'real', queue: [], currentId: undefined }, source);
+    monitoring.voice.connect = async () => { throw new UserError('network=UdpHandshaking'); };
+    monitoring.voice.ready = () => false;
+    await monitoring.init(); await monitoring.tick();
+    assert.equal(monitoring.track()?.id, 'spotify', 'Spotify monitoring survives voice failure');
+    assert.match(monitoring.statusText(), /UdpHandshaking/, 'voice failure remains visible after successful API polling');
+    await monitoring.stop();
+    const audio = create({ ...data, guildId: 'audio', mode: 'mirror', queue: [], currentId: undefined }, source);
+    audio.voice.connect = async () => { throw new UserError('network=UdpHandshaking'); };
+    await assert.rejects(audio.init(), /UdpHandshaking/, 'audio workflow still requires a working voice connection');
+    await audio.stop();
+    const ownerRequests: string[] = [];
+    let upcoming = ['B', 'A', 'B']; let queueCurrent = 'A'; let current = 'A';
+    const song = (id: string) => ({ id: id.repeat(22), title: `Song ${id}`, artist: 'Artist', durationMs: 10000 });
+    const followerSource = new Spotify(store);
+    followerSource.playback = async owner => { ownerRequests.push(owner); return { track: song(current), playing: true, progressMs: 1000, fetchedAt: Date.now() }; };
+    followerSource.queueSnapshot = async owner => { ownerRequests.push(owner); return { current: song(queueCurrent), upcoming: upcoming.map(song), fetchedAt: Date.now() }; };
+    const follower = create({ ...data, guildId: 'follow', source: 'spotify', mode: 'mirror', ownerId: 'personal-owner', queue: [], currentId: undefined }, followerSource);
+    await follower.init();
+    const fields = () => panels.at(-1).embeds[0].toJSON().fields;
+    assert.equal(panels.at(-1).embeds[0].toJSON().title, 'Spotify → Discord');
+    assert.ok(!fields().some((f: any) => /Jam/.test(f.name)));
+    assert.equal(panels.at(-1).components[0].components.length, 1, 'Spotify is controlled in Spotify; panel has only Stop');
+    assert.match(fields().find((f: any) => f.name === 'Далее в Spotify').value, /1\. Artist — Song B[\s\S]*2\. Artist — Song A[\s\S]*3\. Artist — Song B/);
+    assert.ok(ownerRequests.every(owner => owner === 'personal-owner'));
+    const now = Date.now; let offset = 0;
+    try {
+      Date.now = () => now() + offset;
+      upcoming = ['A', 'B']; offset += config.pollMs + 100;
+      await follower.tick();
+      assert.match(fields().find((f: any) => f.name === 'Далее в Spotify').value, /1\. Artist — Song A[\s\S]*2\. Artist — Song B/);
+      queueCurrent = 'B'; offset += config.pollMs + 100; await follower.tick();
+      assert.match(fields().find((f: any) => f.name === 'Далее в Spotify').value, /согласованный снимок/);
+      current = 'B'; offset += config.pollMs + 100; await follower.tick();
+      assert.equal(follower.track()?.id, 'B'.repeat(22));
+      assert.match(fields().find((f: any) => f.name === 'Далее в Spotify').value, /Song A/);
+      assert.equal(store.sessions().find(s => s.guildId === 'follow')?.source, 'spotify');
+    } finally { Date.now = now; await follower.stop(); }
+    const oldEngine = config.engineEnabled; const oldKey = config.engineKey; const oldFetch = globalThis.fetch;
+    store.connect('personal-owner', { access_token: 'test-access', refresh_token: 'test-refresh', scope: 'user-read-private', expiresAt: Date.now()+3600000 }, { id: 'personal-spotify', name: 'Owner', product: 'premium', checkedAt: Date.now() });
+    config.engineEnabled = true; config.engineKey = 'test-engine-key'; current = 'A'; queueCurrent = 'A';
+    const candidate = { id: '11111111-1111-4111-8111-111111111111', title: 'Song A', artist: 'Artist', durationMs: 10000, url: 'https://www.youtube.com/watch?v=abcdefghijk' };
+    globalThis.fetch = (async (url: any) => String(url).includes('/stream') ? new Response(Buffer.alloc(3840), { headers: { 'Content-Type': 'application/octet-stream' } }) : Response.json({ candidates: [candidate] })) as typeof fetch;
+    let streamPlays = 0;
+    const streamed = create({ ...data, guildId: 'engine', source: 'spotify', mode: 'mirror', ownerId: 'personal-owner', queue: [], currentId: undefined }, followerSource);
+    streamed.voice.playPcm = stream => { streamPlays++; stream.destroy(); };
+    try {
+      await streamed.init(); assert.equal(streamPlays, 0, 'unconfirmed search results never play automatically');
+      const request = await streamed.sourceOptions();
+      await assert.rejects(streamed.approveSource('wrong-nonce', 0), /устарел/);
+      await streamed.approveSource(request.nonce, 0);
+      assert.equal(streamPlays, 1); assert.equal(store.audioSource('personal-owner', 'A'.repeat(22))?.url, candidate.url);
+      await assert.rejects(streamed.approveSource(request.nonce, 0), /устарел/);
+      const stale = await streamed.sourceOptions(); current = 'B'; queueCurrent = 'B';
+      Date.now = () => now() + config.pollMs + 100; await streamed.tick();
+      await assert.rejects(streamed.approveSource(stale.nonce, 0), /устарел/);
+      const beforeLogout = await streamed.sourceOptions(); store.deleteToken('personal-owner');
+      await assert.rejects(streamed.approveSource(beforeLogout.nonce, 0), /Spotify отключён/);
+      assert.equal(store.audioSource('personal-owner', 'A'.repeat(22)), undefined);
+    } finally {
+      Date.now = now; await streamed.stop(); config.engineEnabled = oldEngine; config.engineKey = oldKey; globalThis.fetch = oldFetch;
+    }
+
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});

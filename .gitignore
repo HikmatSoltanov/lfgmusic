@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+!.env.hosting.example
+data/*
+!data/.gitkeep
+media/*
+!media/catalog.example.json
+!media/.gitkeep
+*.zip
+*.log
+
+bin/
+
+audio-engine/target/
